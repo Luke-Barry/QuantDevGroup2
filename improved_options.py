@@ -13,6 +13,7 @@ import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import json
+import time
 
 from alpaca.trading.client import TradingClient
 from alpaca.data.historical.stock import StockHistoricalDataClient, StockLatestTradeRequest
@@ -75,6 +76,24 @@ def get_current_price(symbol):
         return current_price
     except Exception as e:
         print(f"Error getting current price for {symbol}: {str(e)}")
+        return None
+
+def get_current_iv(symbol):
+    """Get the current implied volatility of a stock"""
+    try:
+        # TO DO: implement current IV retrieval
+        return 0.5  # placeholder value
+    except Exception as e:
+        print(f"Error getting current IV for {symbol}: {str(e)}")
+        return None
+
+def get_historical_volatility(symbol):
+    """Get the historical volatility of a stock"""
+    try:
+        # TO DO: implement historical IV retrieval
+        return 0.3  # placeholder value
+    except Exception as e:
+        print(f"Error getting historical volatility for {symbol}: {str(e)}")
         return None
 
 def get_option_contracts(symbol, days_min=7, days_max=30, contract_type=None):
@@ -331,67 +350,97 @@ def check_orders_and_positions():
     except Exception as e:
         print(f"Error checking orders and positions: {str(e)}")
 
-def main():
-    """Main function to execute options trading"""
-    # Check account information
-    account = get_account_info()
-    
-    # Choose a symbol to trade
-    symbol = "SPY"  # S&P 500 ETF
+def manage_open_positions():
+    """Monitor open positions and check for take profit/loss conditions"""
+    while True:
+        positions = get_positions()
+        if not positions:
+            print("No open positions to monitor.")
+            time.sleep(60)  # Wait before checking again
+            continue
+        
+        for position in positions:
+            try:
+                # Use cost basis and market value for profit/loss calculations
+                cost_basis = float(position.cost_basis)
+                market_value = float(position.market_value)
+                
+                # Calculate take profit and stop loss prices
+                take_profit_price = cost_basis * 1.2  # 20% profit
+                stop_loss_price = cost_basis * 0.9  # 10% loss
+                
+                if market_value >= take_profit_price:
+                    print(f"Taking profit on {position.symbol}. Market value: ${market_value:.2f}, Take profit price: ${take_profit_price:.2f}")
+                    close_position(position.symbol)
+                elif market_value <= stop_loss_price:
+                    print(f"Stopping loss on {position.symbol}. Market value: ${market_value:.2f}, Stop loss price: ${stop_loss_price:.2f}")
+                    close_position(position.symbol)
+                
+            except Exception as e:
+                print(f"Error managing position for {position.symbol}: {str(e)}")
+        
+        time.sleep(60)  # Wait before checking positions again
+
+def execute_volatility_straddle(symbol):
+    # Check if a straddle position already exists for this symbol
+    positions = get_positions()
+    for position in positions:
+        if position.symbol.startswith(symbol):
+            print(f"Straddle position already exists for {symbol}. Skipping...")
+            return
     
     # Get current price
     current_price = get_current_price(symbol)
-    if not current_price:
-        print("Cannot proceed without current price")
+    if current_price is None:
+        print(f"Could not fetch current price for {symbol}. Exiting strategy.")
         return
     
-    # Get option contracts
-    print("\nGetting call options...")
-    call_contracts = get_option_contracts(symbol, days_min=5, days_max=60, contract_type=ContractType.CALL)
-    
-    print("\nGetting put options...")
-    put_contracts = get_option_contracts(symbol, days_min=5, days_max=60, contract_type=ContractType.PUT)
-    
-    if not call_contracts or not put_contracts:
-        print("Not enough contracts to proceed")
+    # Get current implied volatility
+    current_iv = get_current_iv(symbol)
+    if current_iv is None:
+        print(f"Could not fetch current implied volatility for {symbol}. Exiting strategy.")
         return
     
-    # Find suitable contracts for a straddle (closest ATM call and put)
-    call_contract = find_nearest_strike_contract(call_contracts, current_price, is_call=True, otm_only=False)
-    put_contract = find_nearest_strike_contract(put_contracts, current_price, is_call=False, otm_only=False)
-    
-    if not call_contract or not put_contract:
-        print("Could not find suitable contracts for straddle")
+    # Get historical volatility
+    historical_iv = get_historical_volatility(symbol)
+    if historical_iv is None:
+        print(f"Could not fetch historical volatility for {symbol}. Exiting strategy.")
         return
     
-    # Ask if user wants to place orders
-    print("\nOptions Strategy: Long Straddle")
-    print(f"Call: {call_contract.symbol} - Strike: {call_contract.strike_price}")
-    print(f"Put: {put_contract.symbol} - Strike: {put_contract.strike_price}")
-    
-    action = input("\nWhat would you like to do? (straddle/call/put/positions/exit): ").lower()
-    
-    if action == "straddle":
-        # Place straddle order
-        quantity = int(input("Enter quantity (default 1): ") or 1)
-        place_straddle_order(call_contract, put_contract, quantity)
-    elif action == "call":
-        # Place call order only
-        quantity = int(input("Enter quantity (default 1): ") or 1)
-        place_single_leg_order(call_contract, quantity)
-    elif action == "put":
-        # Place put order only
-        quantity = int(input("Enter quantity (default 1): ") or 1)
-        place_single_leg_order(put_contract, quantity)
-    elif action == "positions":
-        # Show positions
-        positions = get_positions()
-        if positions:
-            symbol_to_close = input("\nEnter symbol to close position (or enter to skip): ")
-            if symbol_to_close:
-                close_position(symbol_to_close)
+    # Entry condition: Current IV > 1.2 * Historical IV
+    if current_iv > 1.2 * historical_iv:
+        print(f"Entry condition met for {symbol}: Current IV ({current_iv:.2f}) > 1.2 * Historical IV ({historical_iv:.2f})")
+        
+        # Calculate position size (2% of total capital)
+        account_info = get_account_info()
+        capital = float(account_info.cash)
+        position_size = min(1, (0.02 * capital) // (current_price * 2))  # 1 straddle = 2 contracts
+        
+        # Get option contracts
+        contracts = get_option_contracts(symbol)
+        call_contract = find_nearest_strike_contract(contracts, current_price, is_call=True)
+        put_contract = find_nearest_strike_contract(contracts, current_price, is_call=False)
+        
+        if call_contract and put_contract:
+            # Place straddle order
+            place_straddle_order(call_contract, put_contract, quantity=int(position_size))
+            
+            # Set take profit and stop loss
+            take_profit_price = current_price * 1.2  # 20% profit
+            stop_loss_price = current_price * 0.9  # 10% loss
+            print(f"Take profit set at ${take_profit_price:.2f}, Stop loss set at ${stop_loss_price:.2f}")
+        else:
+            print(f"Could not find suitable contracts for straddle on {symbol}.")
     else:
-        print("Exiting without placing orders")
+        print(f"Entry condition not met for {symbol}: Current IV ({current_iv:.2f}) <= 1.2 * Historical IV ({historical_iv:.2f})")
+
+def main():
+    symbols = ["SPY", "QQQ", "IWM"]  # Add more symbols as needed
+    for symbol in symbols:
+        execute_volatility_straddle(symbol)
+    
+    # Start managing open positions
+    manage_open_positions()
 
 if __name__ == "__main__":
     main()
