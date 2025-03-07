@@ -119,21 +119,35 @@ def get_option_contracts(symbol, days_min=7, days_max=30, contract_type=None):
     print(f"Looking for contracts with expiration between {min_expiry} and {max_expiry}")
     
     try:
-        # Create request for option contracts
-        request = GetOptionContractsRequest(
+        # Create request for call contracts
+        call_request = GetOptionContractsRequest(
             underlying_symbols=[symbol],
             status=AssetStatus.ACTIVE,
             expiration_date_gte=min_expiry,
             expiration_date_lte=max_expiry,
-            type=contract_type
+            type=ContractType.CALL
         )
         
-        # Get response from API
-        response = trading_client.get_option_contracts(request)
+        # Create request for put contracts
+        put_request = GetOptionContractsRequest(
+            underlying_symbols=[symbol],
+            status=AssetStatus.ACTIVE,
+            expiration_date_gte=min_expiry,
+            expiration_date_lte=max_expiry,
+            type=ContractType.PUT
+        )
         
-        # Convert response to a list
-        contracts = response.option_contracts
+        # Get responses from API
+        call_response = trading_client.get_option_contracts(call_request)
+        put_response = trading_client.get_option_contracts(put_request)
+        
+        # Combine contracts from both responses
+        contracts = call_response.option_contracts + put_response.option_contracts
         print(f"Found {len(contracts)} contracts")
+        
+        # Log details of each contract fetched
+        for contract in contracts:
+            print(f"Contract Symbol: {contract.symbol}, Type: {contract.type}, Strike: {contract.strike_price}, Expiration: {contract.expiration_date}, Open Interest: {contract.open_interest}")
         
         # Print details for the first few contracts
         for i, contract in enumerate(contracts[:5]):
@@ -303,13 +317,14 @@ def get_positions():
 
 def close_position(symbol):
     """Close a position by symbol"""
+    print(f"Attempting to close position for {symbol}...")
     try:
         print(f"\nClosing position for {symbol}...")
         result = trading_client.close_position(symbol_or_asset_id=symbol)
         print(f"Position closed: {result}")
         return result
     except Exception as e:
-        print(f"Error closing position: {str(e)}")
+        print(f"Error closing position for {symbol}: {str(e)}")
         return None
 
 def check_orders_and_positions():
@@ -353,31 +368,62 @@ def check_orders_and_positions():
 def manage_open_positions():
     """Monitor open positions and check for take profit/loss conditions"""
     while True:
-        positions = get_positions()
-        if not positions:
-            print("No open positions to monitor.")
-            time.sleep(60)  # Wait before checking again
-            continue
-        
-        for position in positions:
-            try:
-                # Use cost basis and market value for profit/loss calculations
-                cost_basis = float(position.cost_basis)
-                market_value = float(position.market_value)
-                
-                # Calculate take profit and stop loss prices
-                take_profit_price = cost_basis * 1.2  # 20% profit
-                stop_loss_price = cost_basis * 0.9  # 10% loss
-                
-                if market_value >= take_profit_price:
-                    print(f"Taking profit on {position.symbol}. Market value: ${market_value:.2f}, Take profit price: ${take_profit_price:.2f}")
-                    close_position(position.symbol)
-                elif market_value <= stop_loss_price:
-                    print(f"Stopping loss on {position.symbol}. Market value: ${market_value:.2f}, Stop loss price: ${stop_loss_price:.2f}")
-                    close_position(position.symbol)
-                
-            except Exception as e:
-                print(f"Error managing position for {position.symbol}: {str(e)}")
+        try:
+            positions = get_positions()
+            if not positions:
+                print("No open positions to monitor.")
+                time.sleep(60)  # Wait before checking again
+                continue
+            
+            for position in positions:
+                try:
+                    # Use cost basis and market value for profit/loss calculations
+                    cost_basis = float(position.cost_basis)
+                    market_value = float(position.market_value)
+                    
+                    # Calculate take profit and stop loss prices
+                    take_profit_price = cost_basis * 1.2  # 20% profit
+                    stop_loss_price = cost_basis * 0.9  # 10% loss
+                    
+                    if market_value >= take_profit_price:
+                        print(f"Taking profit on {position.symbol}. Market value: ${market_value:.2f}, Take profit price: ${take_profit_price:.2f}")
+                        # Check if the position exists before closing
+                        if position.symbol in [p.symbol for p in positions]:
+                            print(f"Closing position: {position.symbol}")
+                            close_position(position.symbol)
+                        else:
+                            print(f"Position {position.symbol} not found.")
+                        corresponding_symbol = position.symbol.replace('C', 'P') if 'C' in position.symbol else position.symbol.replace('P', 'C')
+                        # Check if the corresponding position exists before closing
+                        if corresponding_symbol in [p.symbol for p in positions]:
+                            print(f"Closing corresponding position: {corresponding_symbol}")
+                            close_position(corresponding_symbol)
+                        else:
+                            print(f"Corresponding position {corresponding_symbol} not found.")
+                    elif market_value <= stop_loss_price:
+                        print(f"Stopping loss on {position.symbol}. Market value: ${market_value:.2f}, Stop loss price: ${stop_loss_price:.2f}")
+                        # Check if the position exists before closing
+                        if position.symbol in [p.symbol for p in positions]:
+                            print(f"Closing position: {position.symbol}")
+                            close_position(position.symbol)
+                        else:
+                            print(f"Position {position.symbol} not found.")
+                        corresponding_symbol = position.symbol.replace('C', 'P') if 'C' in position.symbol else position.symbol.replace('P', 'C')
+                        # Check if the corresponding position exists before closing
+                        if corresponding_symbol in [p.symbol for p in positions]:
+                            print(f"Closing corresponding position: {corresponding_symbol}")
+                            close_position(corresponding_symbol)
+                        else:
+                            print(f"Corresponding position {corresponding_symbol} not found.")
+                except Exception as e:
+                    print(f"Error managing position for {position.symbol}: {str(e)}")
+            
+            # Check for new straddle opportunities
+            symbols = ["SPY", "QQQ", "IWM"]  # Add more symbols as needed
+            for symbol in symbols:
+                execute_volatility_straddle(symbol)
+        except Exception as e:
+            print(f"Error in managing positions: {str(e)}")
         
         time.sleep(60)  # Wait before checking positions again
 
