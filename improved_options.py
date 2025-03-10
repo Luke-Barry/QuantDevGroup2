@@ -14,9 +14,13 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import json
 import time
+import numpy as np
+import csv
+import yfinance as yf
 
 from alpaca.trading.client import TradingClient
-from alpaca.data.historical.stock import StockHistoricalDataClient, StockLatestTradeRequest
+from alpaca.data.historical.stock import StockHistoricalDataClient, StockLatestTradeRequest, StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.requests import (
     GetOptionContractsRequest,
     MarketOrderRequest,
@@ -78,22 +82,57 @@ def get_current_price(symbol):
         print(f"Error getting current price for {symbol}: {str(e)}")
         return None
 
-def get_current_iv(symbol):
-    """Get the current implied volatility of a stock"""
+def get_historical_prices(symbol, days=30):
+    """Fetch historical prices for a given stock symbol using yfinance."""
     try:
-        # TO DO: implement current IV retrieval
-        return 0.5  # placeholder value
+        stock_data = yf.download(symbol, period=f'{days}d')
+        if stock_data.empty:
+            print(f"No historical data found for {symbol}")
+            return []
+        return stock_data['Close'].values.flatten()  # Flatten to 1D array
     except Exception as e:
-        print(f"Error getting current IV for {symbol}: {str(e)}")
+        print(f"Error fetching historical prices for {symbol}: {str(e)}")
+        return []
+
+def get_historical_volatility(symbol, days=30):
+    """Calculate historical volatility for a given stock symbol using yfinance."""
+    try:
+        historical_prices = get_historical_prices(symbol, days)
+        if len(historical_prices) < 2:
+            print(f"Not enough historical data for {symbol}")
+            return None
+        # Ensure historical_prices is a 1D array
+        if historical_prices.ndim != 1:
+            print(f"Unexpected shape for historical prices for {symbol}: {historical_prices.shape}")
+            return None
+        # Check for NaN values
+        if np.any(np.isnan(historical_prices)):
+            print(f"NaN values found in historical prices for {symbol}")
+            return None
+        returns = np.diff(historical_prices) / historical_prices[:-1]
+        volatility = np.std(returns) * np.sqrt(252)  # Annualize
+        print(f"Historical volatility for {symbol}: {volatility:.2f}")  # Debugging statement
+        return volatility
+    except Exception as e:
+        print(f"Error calculating historical volatility for {symbol}: {str(e)}")
         return None
 
-def get_historical_volatility(symbol):
-    """Get the historical volatility of a stock"""
+def get_current_iv(symbol):
+    """Get the current implied volatility of a stock using yfinance."""
     try:
-        # TO DO: implement historical IV retrieval
-        return 0.3  # placeholder value
+        option_chain = yf.Ticker(symbol).options
+        if not option_chain:
+            print(f"No option contracts found for {symbol}")
+            return None
+        # Fetch the first available option chain
+        contracts = yf.Ticker(symbol).option_chain(option_chain[0])
+        ivs = []
+        for contract in contracts.calls.itertuples():
+            if hasattr(contract, 'impliedVolatility') and contract.impliedVolatility is not None:
+                ivs.append(contract.impliedVolatility)
+        return np.mean(ivs) if ivs else None
     except Exception as e:
-        print(f"Error getting historical volatility for {symbol}: {str(e)}")
+        print(f"Error fetching implied volatility for {symbol}: {str(e)}")
         return None
 
 def get_option_contracts(symbol, days_min=7, days_max=30, contract_type=None):
@@ -144,23 +183,6 @@ def get_option_contracts(symbol, days_min=7, days_max=30, contract_type=None):
         # Combine contracts from both responses
         contracts = call_response.option_contracts + put_response.option_contracts
         print(f"Found {len(contracts)} contracts")
-        
-        # Log details of each contract fetched
-        for contract in contracts:
-            print(f"Contract Symbol: {contract.symbol}, Type: {contract.type}, Strike: {contract.strike_price}, Expiration: {contract.expiration_date}, Open Interest: {contract.open_interest}")
-        
-        # Print details for the first few contracts
-        for i, contract in enumerate(contracts[:5]):
-            if i == 0:
-                print("\nSample contract details:")
-                
-            print(f"Symbol: {contract.symbol}")
-            print(f"Type: {contract.type}")
-            print(f"Strike: {contract.strike_price}")
-            print(f"Expiration: {contract.expiration_date}")
-            if hasattr(contract, 'open_interest'):
-                print(f"Open Interest: {contract.open_interest}")
-            print("---")
         
         return contracts
     except Exception as e:
@@ -215,6 +237,27 @@ def find_nearest_strike_contract(contracts, target_price, is_call=True, otm_only
         print(f"No suitable {'call' if is_call else 'put'} contract found")
     
     return closest_contract
+
+def find_suitable_contracts(symbol):
+    """Find suitable call and put contracts for a straddle on the given symbol."""
+    contracts = get_option_contracts(symbol)
+    if not contracts:
+        print(f"No contracts found for {symbol}")
+        return None, None
+    
+    current_price = get_current_price(symbol)
+    if current_price is None:
+        print(f"Could not fetch current price for {symbol}. Exiting strategy.")
+        return None, None
+    
+    call_contract = find_nearest_strike_contract(contracts, current_price, is_call=True)
+    put_contract = find_nearest_strike_contract(contracts, current_price, is_call=False)
+    
+    if call_contract and put_contract:
+        return call_contract, put_contract
+    else:
+        print(f"Could not find suitable contracts for straddle on {symbol}.")
+        return None, None
 
 def place_single_leg_order(contract, quantity=1, side=OrderSide.BUY, order_type=OrderType.MARKET):
     """
@@ -382,8 +425,8 @@ def manage_open_positions():
                     market_value = float(position.market_value)
                     
                     # Calculate take profit and stop loss prices
-                    take_profit_price = cost_basis * 1.2  # 20% profit
-                    stop_loss_price = cost_basis * 0.9  # 10% loss
+                    take_profit_price = cost_basis * 1.1  # 20% profit
+                    stop_loss_price = cost_basis * 0.95  # 10% loss
                     
                     if market_value >= take_profit_price:
                         print(f"Taking profit on {position.symbol}. Market value: ${market_value:.2f}, Take profit price: ${take_profit_price:.2f}")
@@ -419,13 +462,23 @@ def manage_open_positions():
                     print(f"Error managing position for {position.symbol}: {str(e)}")
             
             # Check for new straddle opportunities
-            symbols = ["SPY", "QQQ", "IWM"]  # Add more symbols as needed
+            symbols = ["SPY", "QQQ", "IWM", "NVDA", "PLTR", "RDDT", "LUNR", "TSLA"]  # Add more symbols as needed
             for symbol in symbols:
                 execute_volatility_straddle(symbol)
         except Exception as e:
             print(f"Error in managing positions: {str(e)}")
         
-        time.sleep(60)  # Wait before checking positions again
+        time.sleep(30)  # Wait before checking positions again
+
+import pytz
+from datetime import datetime
+
+def is_market_open():
+    eastern = pytz.timezone('US/Eastern')
+    current_time = datetime.now(eastern)
+    market_open_time = current_time.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close_time = current_time.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open_time <= current_time <= market_close_time
 
 def execute_volatility_straddle(symbol):
     # Check if a straddle position already exists for this symbol
@@ -435,56 +488,106 @@ def execute_volatility_straddle(symbol):
             print(f"Straddle position already exists for {symbol}. Skipping...")
             return
     
-    # Get current price
-    current_price = get_current_price(symbol)
-    if current_price is None:
-        print(f"Could not fetch current price for {symbol}. Exiting strategy.")
-        return
-    
-    # Get current implied volatility
-    current_iv = get_current_iv(symbol)
-    if current_iv is None:
-        print(f"Could not fetch current implied volatility for {symbol}. Exiting strategy.")
-        return
-    
-    # Get historical volatility
     historical_iv = get_historical_volatility(symbol)
-    if historical_iv is None:
-        print(f"Could not fetch historical volatility for {symbol}. Exiting strategy.")
+    current_iv = get_current_iv(symbol)
+
+    if historical_iv is None or current_iv is None:
+        print(f"Could not calculate volatilities for {symbol}")
         return
-    
-    # Entry condition: Current IV > 1.2 * Historical IV
+
+    # Compare current IV with historical IV
     if current_iv > 1.2 * historical_iv:
-        print(f"Entry condition met for {symbol}: Current IV ({current_iv:.2f}) > 1.2 * Historical IV ({historical_iv:.2f})")
+        print(f"Entering straddle for {symbol}: Current IV ({current_iv:.2f}) is greater than 1.2 times Historical IV ({historical_iv:.2f})")
         
-        # Calculate position size (2% of total capital)
-        account_info = get_account_info()
-        capital = float(account_info.cash)
-        position_size = min(1, (0.02 * capital) // (current_price * 2))  # 1 straddle = 2 contracts
-        
-        # Get option contracts
-        contracts = get_option_contracts(symbol)
-        call_contract = find_nearest_strike_contract(contracts, current_price, is_call=True)
-        put_contract = find_nearest_strike_contract(contracts, current_price, is_call=False)
+        # Get current price
+        current_price = get_current_price(symbol)
+        if current_price is None:
+            print(f"Could not fetch current price for {symbol}. Exiting strategy.")
+            return
+
+        # Define call_contract and put_contract before checking their values
+        call_contract, put_contract = find_suitable_contracts(symbol)
         
         if call_contract and put_contract:
+            if not is_market_open():
+                print(f"Market is closed. Cannot place orders for {symbol}.")
+                return
+            # Calculate position size based on available buying power and cost of contracts
+            account_info = get_account_info()
+            options_buying_power = float(account_info.options_buying_power)  # Ensure options_buying_power is a float
+            print(f"Options buying power: {options_buying_power}")  # Debugging statement
+            cost_basis = (float(call_contract.close_price) + float(put_contract.close_price)) * 2  # Total cost for one straddle
+            max_contracts = int(options_buying_power // cost_basis)
+            position_size = min(max_contracts, 1)  # Limit to 1 straddle
+
             # Place straddle order
-            place_straddle_order(call_contract, put_contract, quantity=int(position_size))
+            place_straddle_order(call_contract, put_contract, quantity=position_size)
             
             # Set take profit and stop loss
-            take_profit_price = current_price * 1.2  # 20% profit
-            stop_loss_price = current_price * 0.9  # 10% loss
+            take_profit_price = current_price * 1.1  # 10% profit
+            stop_loss_price = current_price * 0.95  # 5% loss
             print(f"Take profit set at ${take_profit_price:.2f}, Stop loss set at ${stop_loss_price:.2f}")
         else:
             print(f"Could not find suitable contracts for straddle on {symbol}.")
     else:
         print(f"Entry condition not met for {symbol}: Current IV ({current_iv:.2f}) <= 1.2 * Historical IV ({historical_iv:.2f})")
 
+def weighted_volatility(mid_price, volume):
+    average = np.average(mid_price, weights=volume)
+    variance = np.average((mid_price - average) ** 2, weights=volume)
+    return np.sqrt(variance)
+
+def compute_volatility(api, start_date, end_date, ticker="AAPL", verbose=True):
+    volatility_dict = dict()
+    current_day = start_date
+    delta = datetime.timedelta(days=1)
+
+    while current_day <= end_date:
+        current_day_str = current_day.strftime("%Y-%m-%d")
+        if not np.is_busday(current_day_str):
+            current_day += delta
+            if verbose:
+                print("Skipping " + current_day_str)
+            continue
+
+        start_day = current_day + datetime.timedelta(hours=9, minutes=30)
+        end_day = current_day + datetime.timedelta(hours=16)
+
+        start_day_str = start_day.strftime("%Y-%m-%dT%H:%M:%S-04:00")
+        end_day_str = end_day.strftime("%Y-%m-%dT%H:%M:%S-04:00")
+
+        barset = api.get_barset(ticker, "minute", start=start_day_str, end=end_day_str)
+        parsed_bar = barset[ticker]
+
+        if len(parsed_bar) == 0:
+            current_day += delta
+            if verbose:
+                print("Skipping " + current_day_str)
+            continue
+
+        if verbose:
+            print("Processing " + current_day_str)
+
+        mid_price = [np.average([x.h, x.l]) for x in parsed_bar]
+        volume = [x.v for x in parsed_bar]
+
+        volatility = weighted_volatility(mid_price, volume)
+        volatility_dict[current_day_str] = volatility
+
+        current_day += delta
+
+    return volatility_dict
+
 def main():
-    symbols = ["SPY", "QQQ", "IWM"]  # Add more symbols as needed
+    symbols = ["SPY", "QQQ", "IWM", "NVDA", "PLTR", "RDDT", "LUNR", "TSLA"]  # Add more symbols as needed
     for symbol in symbols:
+        historical_iv = get_historical_volatility(symbol)
+        current_iv = get_current_iv(symbol)
+        print(f"Current IV for {symbol}: {current_iv}")
+
+        # Call the straddle execution function
         execute_volatility_straddle(symbol)
-    
+
     # Start managing open positions
     manage_open_positions()
 
